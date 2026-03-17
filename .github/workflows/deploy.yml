@@ -1,0 +1,134 @@
+name: SI Shop — Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '18'
+
+jobs:
+  build_and_deploy:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+    runs-on: ubuntu-latest
+    name: Build & Deploy
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: api/package.json
+
+      - name: Install API dependencies
+        run: cd api && npm ci
+
+      - name: Deploy to Azure Static Web Apps
+        id: deploy
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: upload
+          app_location: frontend
+          api_location: api
+          output_location: ''
+          skip_app_build: true
+
+      - name: Show URL
+        run: echo "✅ Deployed to ${{ steps.deploy.outputs.static_web_app_url }}"
+
+  provision_azure:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    name: Provision Azure Infrastructure
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create Resource Group
+        run: |
+          az group create --name si-shop-rg --location eastus --tags project=si-shop --output none
+          echo "✓ Resource group ready"
+
+      - name: Create Key Vault
+        run: |
+          az keyvault create --name si-shop-kv --resource-group si-shop-rg --location eastus --sku standard --output none 2>/dev/null || true
+          echo "✓ Key Vault ready"
+
+      - name: Load all secrets
+        run: |
+          KV="si-shop-kv"
+          az keyvault secret set --vault-name $KV --name "D365-CLIENT-ID"        --value "${{ secrets.D365_CLIENT_ID }}"        --output none
+          az keyvault secret set --vault-name $KV --name "D365-CLIENT-SECRET"    --value "${{ secrets.D365_CLIENT_SECRET }}"    --output none
+          az keyvault secret set --vault-name $KV --name "D365-TENANT-ID"        --value "${{ secrets.D365_TENANT_ID }}"        --output none
+          az keyvault secret set --vault-name $KV --name "AVALARA-ACCOUNT-ID"    --value "${{ secrets.AVALARA_ACCOUNT_ID }}"    --output none
+          az keyvault secret set --vault-name $KV --name "AVALARA-LICENSE-KEY"   --value "${{ secrets.AVALARA_LICENSE_KEY }}"   --output none
+          az keyvault secret set --vault-name $KV --name "AVALARA-COMPANY-CODE"  --value "${{ secrets.AVALARA_COMPANY_CODE }}"  --output none
+          az keyvault secret set --vault-name $KV --name "NMI-SECURITY-KEY"      --value "${{ secrets.NMI_SECURITY_KEY }}"      --output none
+          az keyvault secret set --vault-name $KV --name "AMAZON-PA-ACCESS-KEY"  --value "${{ secrets.AMAZON_PA_ACCESS_KEY }}"  --output none
+          az keyvault secret set --vault-name $KV --name "AMAZON-PA-SECRET-KEY"  --value "${{ secrets.AMAZON_PA_SECRET_KEY }}"  --output none
+          az keyvault secret set --vault-name $KV --name "AMAZON-PA-PARTNER-TAG" --value "${{ secrets.AMAZON_PA_PARTNER_TAG }}" --output none
+          echo "✓ All 10 secrets loaded"
+
+      - name: Create Storage + Function App
+        run: |
+          az storage account create --name sishopstorage --resource-group si-shop-rg --location eastus --sku Standard_LRS --output none 2>/dev/null || true
+          az functionapp create \
+            --name si-shop-api \
+            --resource-group si-shop-rg \
+            --storage-account sishopstorage \
+            --consumption-plan-location eastus \
+            --runtime node --runtime-version 18 \
+            --os-type Linux --functions-version 4 \
+            --output none 2>/dev/null || true
+          echo "✓ Function App ready"
+
+      - name: Enable Managed Identity + Key Vault access
+        run: |
+          az functionapp identity assign --name si-shop-api --resource-group si-shop-rg --output none
+          PRINCIPAL_ID=$(az functionapp identity show --name si-shop-api --resource-group si-shop-rg --query principalId -o tsv)
+          az keyvault set-policy --name si-shop-kv --object-id $PRINCIPAL_ID --secret-permissions get list --output none
+          echo "✓ Managed Identity enabled"
+
+      - name: Configure Function App settings
+        run: |
+          az functionapp config appsettings set \
+            --name si-shop-api --resource-group si-shop-rg \
+            --settings \
+              KEY_VAULT_URL="https://si-shop-kv.vault.azure.net" \
+              D365_BASE_URL="${{ secrets.D365_BASE_URL }}" \
+              DEFAULT_PRICE_LIST_NAME="Retail Price List" \
+              SI_MARKUP_PCT="35" \
+            --output none
+          echo "✓ App settings configured"
+
+      - name: Done
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  ✅ Azure infrastructure ready!"
+          echo "  ⚙️  https://si-shop-api.azurewebsites.net"
+          echo "  🔑 https://si-shop-kv.vault.azure.net"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  close_pull_request:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    name: Close PR Staging
+    steps:
+      - uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          action: close
