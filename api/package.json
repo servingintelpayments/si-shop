@@ -1,0 +1,21 @@
+{
+  "name": "si-shop-api",
+  "version": "1.0.0",
+  "description": "SI Shop — Azure Functions API",
+  "scripts": {
+    "start": "func start",
+    "test": "jest --coverage",
+    "lint": "eslint **/*.js"
+  },
+  "dependencies": {
+    "@azure/identity": "^4.0.0",
+    "@azure/keyvault-secrets": "^4.8.0"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0",
+    "eslint": "^8.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
